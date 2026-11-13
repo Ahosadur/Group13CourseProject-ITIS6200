@@ -23,7 +23,7 @@ git --version
 ## 2. Clone the repository
 
 ```powershell
-git clone <YOUR-GITHUB-REPOSITORY-URL>
+git clone https://github.com/Ahosadur/Group13CourseProject-ITIS6200
 cd Password-Migration-Project
 ```
 
