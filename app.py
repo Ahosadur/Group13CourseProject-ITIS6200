@@ -50,6 +50,18 @@ password_hasher = PasswordHasher(
     type=Type.ID,
 )
 
+# Inactive-account migration policy
+# Accounts still using MD5 after this deadline must reset their passwords.
+migration_deadline = datetime(
+    2026, 12, 24, 0, 0, 0, tzinfo=timezone.utc
+    #2026, 11, 25, 0, 0, 0, tzinfo=timezone.utc
+)
+
+minimum_new_password_length = 12
+
+
+def migration_deadline_passed():
+    return datetime.now(timezone.utc) >= migration_deadline
 
 # Authentication protection policy (tunable for the demonstration).
 # Account: 8 failures in 10 minutes; IP: 20 failures in 5 minutes.
@@ -487,29 +499,68 @@ def migrate_md5_account(user, password):
     return None
 
 
+# def authenticate_user(username, password):
+#     user = get_user_by_username(username)
+#     if user is None:
+#         return False, False
+
+#     if user["hash_scheme"] == "md5":
+#         if not verify_legacy_md5(password, user["password_hash"]):
+#             return False, False
+
+#         record_migration_event(
+#             user["user_id"], user["username"], "legacy_md5_verified",
+#             "The submitted password matched the legacy MD5 verifier."
+#         )
+#         result = migrate_md5_account(user, password)
+#         if result is None:
+#             return False, False
+#         return True, result
+
+#     if user["hash_scheme"] == "argon2id":
+#         return verify_argon2id(password, user["password_hash"]), False
+
+#     # Unknown schemes fail closed.
+#     return False, False
+
+
 def authenticate_user(username, password):
     user = get_user_by_username(username)
+
     if user is None:
-        return False, False
+        return False, False, False
 
     if user["hash_scheme"] == "md5":
         if not verify_legacy_md5(password, user["password_hash"]):
-            return False, False
+            return False, False, False
 
         record_migration_event(
             user["user_id"], user["username"], "legacy_md5_verified",
             "The submitted password matched the legacy MD5 verifier."
         )
+
+        # After the deadline, require a password reset instead
+        # of automatically migrating the old password.
+        if migration_deadline_passed():
+            record_migration_event(
+                user["user_id"], user["username"],
+                "forced_password_reset_required",
+                "Legacy MD5 account authenticated after the migration deadline."
+            )
+            return True, False, True
+
         result = migrate_md5_account(user, password)
+
         if result is None:
-            return False, False
-        return True, result
+            return False, False, False
+
+        return True, result, False
 
     if user["hash_scheme"] == "argon2id":
-        return verify_argon2id(password, user["password_hash"]), False
+        return verify_argon2id(password, user["password_hash"]), False, False
 
     # Unknown schemes fail closed.
-    return False, False
+    return False, False, False
 
 
 # ============================================================
@@ -608,6 +659,61 @@ button{width:100%;margin-top:22px}.admin-link{margin-top:12px;background:#1a2a40
 <a class="button admin-link" href="{{ url_for('admin_login') }}">Open administrator console</a>
 <p class="small">The login process checks the account's current hash scheme. A successful legacy MD5 login triggers an automatic Argon2id upgrade.</p>
 </section></main></body></html>
+"""
+
+
+RESET_PAGE = """
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Required Password Reset</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;background:#0b1220;color:#edf3fc;
+font:15px/1.55 Segoe UI,Arial,sans-serif;display:grid;place-items:center;padding:24px}
+.panel{width:min(460px,100%);background:#111c2e;border:1px solid #26364f;
+border-radius:18px;padding:36px;box-shadow:0 20px 60px #0006}
+h1{font-size:27px;margin:0 0 10px}
+p{color:#9aabc2}
+.notice{padding:12px;background:#351e29;border:1px solid #76434a;
+border-radius:9px;color:#ffd9dd;margin:14px 0}
+label{display:block;margin:18px 0 7px;color:#c7d4e6;font-weight:650}
+input{width:100%;padding:13px;border-radius:9px;border:1px solid #344762;
+background:#0c1626;color:white;font-size:15px}
+button{width:100%;margin-top:22px;padding:14px;border:0;border-radius:9px;
+background:#347ed7;color:white;font-weight:750;font-size:15px;cursor:pointer}
+.small{font-size:12px;color:#879bb5;margin-top:18px}
+</style>
+</head>
+<body>
+<main class="panel">
+<h1>Password reset required</h1>
+<p>Your account still uses the legacy MD5 password system. The migration deadline has passed. Choose a new password to secure your account with Argon2id.</p>
+
+{% for message in get_flashed_messages() %}
+<div class="notice">{{ message }}</div>
+{% endfor %}
+
+<form method="post" action="{{ url_for('password_reset') }}">
+<input type="hidden" name="_csrf" value="{{ csrf_token() }}">
+
+<label for="new_password">New password</label>
+<input id="new_password" type="password" name="new_password"
+autocomplete="new-password" minlength="12" required>
+
+<label for="confirm_password">Confirm new password</label>
+<input id="confirm_password" type="password" name="confirm_password"
+autocomplete="new-password" minlength="12" required>
+
+<button type="submit">Reset password securely</button>
+</form>
+
+<p class="small">Your new password must contain at least 12 characters.</p>
+</main>
+</body>
+</html>
 """
 
 
@@ -1049,7 +1155,8 @@ def login():
         return response
 
     try:
-        authenticated, migrated = authenticate_user(username, password)
+        #authenticated, migrated = authenticate_user(username, password)
+        authenticated, migrated, reset_required = authenticate_user(username, password)
     except RuntimeError as exc:
         if str(exc) == "argon2_capacity":
             record_security_event(
@@ -1100,6 +1207,12 @@ def login():
 
     session.clear()
     session.permanent = True
+
+    if reset_required:
+        session["password_reset_user_id"] = user["user_id"]
+        session["password_reset_username"] = user["username"]
+        return redirect(url_for("password_reset"))
+
     session["user_id"] = user["user_id"]
     session["username"] = user["username"]
     session["login_migrated"] = bool(migrated)
@@ -1124,6 +1237,101 @@ def dashboard():
     return render_template_string(
         USER_PAGE, user=user, migrated=migrated, message=message
     )
+
+
+
+@app.route("/reset-password", methods=["GET", "POST"])
+def password_reset():
+    # Only users who authenticated with an expired MD5 account may reset here.
+    user_id = session.get("password_reset_user_id")
+    username = session.get("password_reset_username")
+
+    if not user_id or not username:
+        return redirect(url_for("index"))
+
+    user = get_user_by_username(username)
+
+    # Refuse stale reset sessions or accounts that are no longer MD5.
+    if not user or user["user_id"] != user_id or user["hash_scheme"] != "md5":
+        session.clear()
+        flash("Please sign in again to continue.")
+        return redirect(url_for("index"))
+
+    if request.method == "GET":
+        return render_template_string(RESET_PAGE)
+
+    validate_csrf()
+
+    new_password = request.form.get("new_password", "")
+    confirm_password = request.form.get("confirm_password", "")
+
+    if len(new_password) < minimum_new_password_length:
+        flash("Your new password must contain at least 12 characters.")
+        return render_template_string(RESET_PAGE), 400
+
+    if new_password != confirm_password:
+        flash("The passwords do not match.")
+        return render_template_string(RESET_PAGE), 400
+
+    if not acquire_argon2_slot():
+        flash("Password security service is busy. Please try again.")
+        return render_template_string(RESET_PAGE), 503
+
+    try:
+        new_hash = password_hasher.hash(new_password)
+    finally:
+        release_argon2_slot()
+
+    migrated_at = utc_now()
+    connection = get_database_connection()
+
+    try:
+        cursor = connection.execute("""
+            UPDATE users
+               SET password_hash = ?,
+                   hash_scheme = 'argon2id',
+                   migration_status = 'migrated',
+                   migrated_at = ?
+             WHERE user_id = ?
+               AND hash_scheme = 'md5'
+        """, (new_hash, migrated_at, user_id))
+
+        if cursor.rowcount != 1:
+            connection.rollback()
+            session.clear()
+            flash("The account changed. Please sign in again.")
+            return redirect(url_for("index"))
+
+        insert_migration_event(
+            connection, user_id, username,
+            "argon2id_hash_generated",
+            "A new Argon2id hash was generated during the required password reset."
+        )
+        insert_migration_event(
+            connection, user_id, username,
+            "legacy_hash_replaced",
+            "The stored MD5 verifier was replaced; it was not retained."
+        )
+        insert_migration_event(
+            connection, user_id, username,
+            "forced_password_reset_completed",
+            "The account completed the required password reset after the migration deadline."
+        )
+        insert_migration_event(
+            connection, user_id, username,
+            "migration_completed",
+            "The account now uses direct Argon2id authentication."
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+    session.clear()
+    flash("Password reset complete. Please sign in with your new password.")
+    return redirect(url_for("index"))
 
 
 @app.route("/logout", methods=["POST"])
